@@ -376,6 +376,27 @@ func (m *manifestFile) FetchEntries(fs iceio.IO, discardDeleted bool) (_ []Manif
 	return ReadManifest(m, f, discardDeleted)
 }
 
+// applyDayTransformDates marks every day(...) partition field described by the
+// manifest's partition-spec metadata as a "date" logical type, so day-transform
+// partition values decode to iceberg.Date whether the writer used a plain Avro
+// int or an int with the date logical type (the Iceberg spec requires readers
+// to accept both). Other integer transforms (year/month/hour) are untouched.
+// Absent or malformed partition-spec metadata is ignored.
+func applyDayTransformDates(specJSON []byte, fieldIDToType map[int]string) {
+	if len(specJSON) == 0 {
+		return
+	}
+	var fields []PartitionField
+	if err := json.Unmarshal(specJSON, &fields); err != nil {
+		return
+	}
+	for _, f := range fields {
+		if _, ok := f.Transform.(DayTransform); ok {
+			fieldIDToType[f.FieldID] = atype.Date
+		}
+	}
+}
+
 func getFieldIDMap(sc *avro.Schema) (map[string]int, map[int]string, map[int]int) {
 	root := sc.Root()
 	getField := func(node avro.SchemaNode, name string) *avro.SchemaField {
@@ -667,6 +688,11 @@ func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error)
 		}
 	}
 	fieldNameToID, fieldIDToType, fieldIDToSize := getFieldIDMap(sc)
+	// bifrost patch (upstream apache/iceberg-go main, 2026-09-18): day(...)
+	// partition values may be written as a plain Avro int (Athena/Trino) or as
+	// an int with the "date" logical type; overlay the manifest's partition
+	// spec so day fields always decode to iceberg.Date and re-encode cleanly.
+	applyDayTransformDates(metadata["partition-spec"], fieldIDToType)
 
 	inheritRowIDs := formatVersion >= 3 &&
 		content == ManifestContentData &&
@@ -797,6 +823,14 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 		fieldToIDMap.setFieldNameToIDMap(c.fieldNameToID)
 		fieldToIDMap.setFieldIDToLogicalTypeMap(c.fieldIDToType)
 		fieldToIDMap.setFieldIDToFixedSizeMap(c.fieldIDToSize)
+		// bifrost patch: materialize the decoded partition values NOW, under the
+		// reader's logical types — a manifest writer re-encoding this entry
+		// (a DELETED/EXISTING copy) replaces the maps with its own before the
+		// lazy init would run, and a day(...) value decoded as time.Time then
+		// reaches the Avro encoder unconverted.
+		if df, ok := tmp.DataFile().(*dataFile); ok {
+			df.initializeMapData()
+		}
 	}
 
 	return tmp, nil
@@ -1701,6 +1735,10 @@ func avroPartitionData(input map[int]any, logicalTypes map[int]string) map[int]a
 	for k, v := range input {
 		if logical, ok := logicalTypes[k]; ok {
 			out[k] = convertLogicalTypeValue(v, logical)
+		} else if t, ok := v.(time.Time); ok {
+			// bifrost patch: a date decoded as time.Time bound for a plain-int
+			// partition field (day transform) — epoch days, as the spec reads it.
+			out[k] = int32(t.Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
 		} else {
 			out[k] = v
 		}
