@@ -15,6 +15,14 @@ bifrost's `go.mod` pins a tag of this fork:
   `day()`-partitioned table with Athena-written manifests fails: `avro: field data_file.partition.pointdate_day: cannot
   use time.Time with Avro type int`.
 
+- `v0.6.0-bifrost.2` (2026-10-10) — `manifest.go`: a manifest LIST whose OCF metadata carries no `format-version` key is
+  read at the version its writer schema implies (`sequence_number` ⇒ v2, `first_row_id` ⇒ v3) instead of being assumed v1.
+  duckdb's Iceberg writer omits the key on every v2 append, so every manifest the list named was refused with
+  `manifest file's 'format-version' metadata indicates version 2, but entry from manifest list indicates version 1` —
+  the reason a duckdb-written table was "closed to iceberg-go" until a Trino/Athena pack rewrote the list (bifrost
+  SCRUM-359/361). Tests: `TestReadManifestListNoFormatVersionV2`, `TestManifestListVersionFromSchema`. Upstream: the
+  spec makes the key optional on lists; upstream main still assumes v1 (no issue filed yet).
+
 ## Making a change
 
 1. Branch from `bifrost-v0.6.0`, patch, `go vet ./...`, commit with a message that names the upstream issue/commit.

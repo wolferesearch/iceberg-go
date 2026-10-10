@@ -898,7 +898,11 @@ func ReadManifest(m ManifestFile, f io.Reader, discardDeleted bool) ([]ManifestE
 //
 // Per the Iceberg spec, manifest list files are not required to carry a
 // "format-version" metadata key (only manifest files are). When the key is
-// absent, version 1 is assumed.
+// absent the version is taken from the list's own writer schema: a v2+ list
+// carries sequence_number, a v3 list first_row_id (bifrost fork: duckdb's
+// writer omits the key on v2 lists, and assuming v1 made every manifest in
+// them unreadable — "format-version 2, but entry from manifest list
+// indicates version 1").
 func ReadManifestList(in io.Reader) ([]ManifestFile, error) {
 	var version int
 
@@ -911,6 +915,8 @@ func ReadManifestList(in io.Reader) ([]ManifestFile, error) {
 			}
 
 			version = v
+		} else {
+			version = manifestListVersionFromSchema(rd.Schema())
 		}
 
 		if version == 1 {
@@ -928,6 +934,35 @@ func ReadManifestList(in io.Reader) ([]ManifestFile, error) {
 	}
 
 	return decodeManifests[*manifestFile](rd, version)
+}
+
+// manifestListVersionFromSchema infers a manifest list's format version from
+// its writer schema when the "format-version" metadata key is absent:
+// sequence_number exists from v2, first_row_id from v3; neither means v1.
+func manifestListVersionFromSchema(sc *avro.Schema) int {
+	if sc == nil {
+		return 1
+	}
+	var rec struct {
+		Fields []struct {
+			Name string `json:"name"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal([]byte(sc.String()), &rec); err != nil {
+		return 1
+	}
+	version := 1
+	for _, f := range rec.Fields {
+		switch f.Name {
+		case "sequence_number":
+			if version < 2 {
+				version = 2
+			}
+		case "first_row_id":
+			version = 3
+		}
+	}
+	return version
 }
 
 type writerImpl interface {

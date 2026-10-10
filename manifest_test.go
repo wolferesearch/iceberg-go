@@ -860,6 +860,13 @@ func writeLegacyManifestListV1(t *testing.T) bytes.Buffer {
 // Iceberg field names (added_data_files_count etc.) as writer schema field names.
 func writeLegacyManifestListV2(t *testing.T) bytes.Buffer {
 	t.Helper()
+	return writeManifestListV2OCF(t, map[string][]byte{"format-version": []byte("2")})
+}
+
+// writeManifestListV2OCF writes one v2 manifest-list record with the given OCF
+// metadata (nil = no "format-version" key, as duckdb's writer emits).
+func writeManifestListV2OCF(t *testing.T, meta map[string][]byte) bytes.Buffer {
+	t.Helper()
 
 	const schemaJSON = `{
 		"type": "record",
@@ -903,9 +910,11 @@ func writeLegacyManifestListV2(t *testing.T) bytes.Buffer {
 	}
 
 	var buf bytes.Buffer
-	enc, err := ocf.NewWriter(&buf, sc,
-		ocf.WithSchema(schemaJSON),
-		ocf.WithMetadata(map[string][]byte{"format-version": []byte("2")}))
+	opts := []ocf.WriterOpt{ocf.WithSchema(schemaJSON)}
+	if meta != nil {
+		opts = append(opts, ocf.WithMetadata(meta))
+	}
+	enc, err := ocf.NewWriter(&buf, sc, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -946,6 +955,36 @@ func (m *ManifestTestSuite) TestReadManifestListLegacyFieldNamesV1() {
 	m.EqualValues(1, list[0].ExistingDataFiles())
 	m.True(list[0].HasExistingFiles())
 	m.EqualValues(2, list[0].DeletedDataFiles())
+}
+
+// TestReadManifestListNoFormatVersionV2 (bifrost fork): a v2 manifest list whose
+// OCF metadata carries no "format-version" key — what duckdb's Iceberg writer
+// emits on every append — is read as v2 from its writer schema (sequence_number),
+// not assumed v1. Before the fix every manifest it listed was refused with
+// "format-version 2, but entry from manifest list indicates version 1".
+func (m *ManifestTestSuite) TestReadManifestListNoFormatVersionV2() {
+	buf := writeManifestListV2OCF(m.T(), nil)
+	list, err := ReadManifestList(&buf)
+	m.Require().NoError(err)
+	m.Len(list, 1)
+	m.Equal(2, list[0].Version())
+	m.EqualValues(3, list[0].SequenceNum())
+	m.EqualValues(3, list[0].MinSequenceNum())
+	m.EqualValues(3, list[0].AddedDataFiles())
+}
+
+// TestManifestListVersionFromSchema pins the inference: v1 has no sequence_number,
+// v2 adds it, v3 adds first_row_id; a nil or non-record schema is v1.
+func (m *ManifestTestSuite) TestManifestListVersionFromSchema() {
+	mk := func(fields string) *avro.Schema {
+		sc, err := avro.Parse(`{"type":"record","name":"manifest_file","fields":[` + fields + `]}`)
+		m.Require().NoError(err)
+		return sc
+	}
+	m.Equal(1, manifestListVersionFromSchema(nil))
+	m.Equal(1, manifestListVersionFromSchema(mk(`{"name":"manifest_path","type":"string"}`)))
+	m.Equal(2, manifestListVersionFromSchema(mk(`{"name":"manifest_path","type":"string"},{"name":"sequence_number","type":"long"}`)))
+	m.Equal(3, manifestListVersionFromSchema(mk(`{"name":"sequence_number","type":"long"},{"name":"first_row_id","type":["null","long"]}`)))
 }
 
 // TestReadManifestListLegacyFieldNamesV2 verifies that V2 manifest lists written
