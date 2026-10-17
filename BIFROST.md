@@ -23,6 +23,22 @@ bifrost's `go.mod` pins a tag of this fork:
   SCRUM-359/361). Tests: `TestReadManifestListNoFormatVersionV2`, `TestManifestListVersionFromSchema`. Upstream: the
   spec makes the key optional on lists; upstream main still assumes v1 (no issue filed yet).
 
+- `v0.6.0-bifrost.3` (2026-10-17) — read-side statistics projection (bifrost SCRUM-434/435). `manifest.go`:
+  `NewManifestReaderWith` / `ManifestEntriesWith` take `ManifestReadOption`s. `WithoutColumnStats()` resolves the file's
+  writer schema against a copy of itself without `column_sizes`, `value_counts`, `null_value_counts`, `nan_value_counts`,
+  `distinct_counts`, `lower_bounds`, `upper_bounds` (`ocf.WithReaderSchemaFunc` + `avro.Resolve`), so the decoder skips
+  those bytes without building values; `KeepBounds(ids...)` keeps the two bound fields and trims them to the ids after
+  decode. Every schema-derived fact (field ids, logical types, v1 fallback) still comes from the WRITER schema. A file read
+  this way answers `ColumnStatsProjected()` (helper `iceberg.ColumnStatsProjected(df)`), its statistics accessors return
+  nil, and `ManifestWriter.Add/Existing/Delete` refuse it with `ErrProjectedEntry` — a projected entry can never be
+  written back as a manifest with statistics silently missing. Nothing changes without options; no writer or scan in this
+  package uses them. `table.NewManifestEvaluator` exports the manifest-level partition-summary evaluator for callers that
+  walk manifests themselves. Why: a 2,465-column table's manifests carry ~15,000 statistics per data file (218 MB for
+  4,523 files); a mirror walk that needs only path/partition/record count/two bounds held ~3.5 GB through `PlanFiles`.
+  Measured on a synthetic 1,500-column × 40-file manifest: full read 36.5 MB allocated, no statistics 7.2 MB, two bounds
+  kept 12.2 MB (the bound maps cannot be projected by key, so they are decoded then trimmed — a decode-time key filter
+  via `avro.CustomType` is the next step if needed). Tests: `manifest_projection_test.go`. Upstream: not proposed.
+
 ## Making a change
 
 1. Branch from `bifrost-v0.6.0`, patch, `go vet ./...`, commit with a message that names the upstream issue/commit.

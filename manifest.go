@@ -610,6 +610,7 @@ type ManifestReader struct {
 	fieldNameToID map[string]int
 	fieldIDToType map[int]string
 	fieldIDToSize map[int]int
+	opts          manifestReadOptions // bifrost fork: read-side projection (WithoutColumnStats)
 
 	// The rest are lazily populated, on demand. Most readers
 	// will likely only try to load the entries.
@@ -631,13 +632,39 @@ type ManifestReader struct {
 // file. If the caller is interested in the manifest entries in the file, it must call
 // [ManifestReader.Entries] before closing the provided reader.
 func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error) {
-	rd, err := ocf.NewReader(in)
+	return NewManifestReaderWith(file, in)
+}
+
+// NewManifestReaderWith is NewManifestReader with read options (bifrost fork).
+// With none it is byte-for-byte the default reader. With WithoutColumnStats the
+// OCF reader resolves the file's writer schema against a projection of itself
+// that lacks the statistics fields, so the Avro decoder skips those bytes
+// without building values; every schema-derived fact (field ids, logical
+// types, format fallbacks) is still taken from the WRITER schema.
+func NewManifestReaderWith(file ManifestFile, in io.Reader, opts ...ManifestReadOption) (*ManifestReader, error) {
+	var o manifestReadOptions
+	for _, apply := range opts {
+		apply(&o)
+	}
+	var writerSchema *avro.Schema
+	var rdOpts []ocf.ReaderOpt
+	if drop := o.droppedFields(); drop != nil {
+		rdOpts = append(rdOpts, ocf.WithReaderSchemaFunc(func(rd *ocf.Reader) (*avro.Schema, error) {
+			writerSchema = rd.Schema()
+
+			return projectEntrySchema(writerSchema, drop)
+		}))
+	}
+	rd, err := ocf.NewReader(in, rdOpts...)
 	if err != nil {
 		return nil, err
 	}
+	if writerSchema == nil {
+		writerSchema = rd.Schema()
+	}
 
 	metadata := rd.Metadata()
-	sc := rd.Schema()
+	sc := writerSchema
 
 	formatVersion := 1
 	// format-version is optional for v1 manifest files, so default to v1.
@@ -713,6 +740,7 @@ func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error)
 		fieldIDToSize:  fieldIDToSize,
 		inheritRowIDs:  inheritRowIDs,
 		nextFirstRowID: nextFirstRowID,
+		opts:           o,
 	}, nil
 }
 
@@ -819,6 +847,11 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 			c.nextFirstRowID += df.Count()
 		}
 	}
+	// bifrost fork: a projected read marks the file and trims its bounds BEFORE
+	// the lazy maps are built from the decoded slices.
+	if df, ok := tmp.DataFile().(*dataFile); ok {
+		c.opts.apply(df)
+	}
 	if fieldToIDMap, ok := tmp.DataFile().(hasFieldToIDMap); ok {
 		fieldToIDMap.setFieldNameToIDMap(c.fieldNameToID)
 		fieldToIDMap.setFieldIDToLogicalTypeMap(c.fieldIDToType)
@@ -840,8 +873,13 @@ func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
 // the provided reader without buffering them. If discardDeleted is true,
 // entries whose status is "deleted" are skipped.
 func iterManifest(m ManifestFile, f io.Reader, discardDeleted bool) iter.Seq2[ManifestEntry, error] {
+	return iterManifestWith(m, f, discardDeleted)
+}
+
+// iterManifestWith is iterManifest under read options (bifrost fork).
+func iterManifestWith(m ManifestFile, f io.Reader, discardDeleted bool, opts ...ManifestReadOption) iter.Seq2[ManifestEntry, error] {
 	return func(yield func(ManifestEntry, error) bool) {
-		manifestReader, err := NewManifestReader(m, f)
+		manifestReader, err := NewManifestReaderWith(m, f, opts...)
 		if err != nil {
 			yield(nil, err)
 
@@ -1361,6 +1399,9 @@ func (w *ManifestWriter) meta() (map[string][]byte, error) {
 func (w *ManifestWriter) addEntry(entry *manifestEntry) error {
 	if w.closed {
 		return errors.New("cannot add entry to closed manifest writer")
+	}
+	if ColumnStatsProjected(entry.DataFile()) {
+		return fmt.Errorf("%w: %s", ErrProjectedEntry, entry.DataFile().FilePath())
 	}
 
 	switch entry.Status() {
@@ -1892,8 +1933,9 @@ type dataFile struct {
 	fieldIDToPartitionData map[int]any
 	fieldIDToFixedSize     map[int]int
 
-	specID   int32
-	initMaps sync.Once
+	specID         int32
+	initMaps       sync.Once
+	statsProjected bool // bifrost fork: decoded under WithoutColumnStats
 }
 
 func (d *dataFile) initializeMapData() {
@@ -2495,3 +2537,175 @@ var PositionalDeleteSchema = NewSchema(0,
 	NestedField{ID: 2147483546, Type: PrimitiveTypes.String, Name: "file_path", Required: true},
 	NestedField{ID: 2147483545, Type: PrimitiveTypes.Int64, Name: "pos", Required: true},
 )
+
+// ---------------------------------------------------------------------------
+// bifrost fork: read-side statistics projection.
+//
+// A wide table's manifests carry six statistics per column per data file; a
+// reader that only needs each file's path, partition, record count and the
+// bounds of a column or two still decodes all of them (a 2,500-column table:
+// ~15,000 values per file, most of a manifest's bytes). These options let such
+// a reader skip them at decode time. They change nothing by default and are
+// never applied by this package's own writers or scans.
+// ---------------------------------------------------------------------------
+
+// ManifestReadOption adjusts how NewManifestReaderWith / ManifestEntriesWith
+// decode entries. With no options every field is decoded, exactly as
+// NewManifestReader always has.
+type ManifestReadOption func(*manifestReadOptions)
+
+type manifestReadOptions struct {
+	skipColumnStats bool
+	keepBounds      bool
+	boundIDs        map[int]struct{} // nil with keepBounds => every bound stays
+}
+
+// WithoutColumnStats drops the per-column statistics at decode time: the reader
+// schema omits column_sizes, value_counts, null_value_counts, nan_value_counts,
+// distinct_counts, lower_bounds and upper_bounds, and the Avro decoder skips
+// their bytes without building values. Entries read this way report
+// ColumnStatsProjected() == true, their statistics accessors return nil, and a
+// ManifestWriter refuses them (ErrProjectedEntry). Pair with KeepBounds to
+// retain the bounds of a few columns.
+func WithoutColumnStats() ManifestReadOption {
+	return func(o *manifestReadOptions) { o.skipColumnStats = true }
+}
+
+// KeepBounds keeps lower_bounds/upper_bounds for exactly these field ids and
+// drops every other bound after decode; with no ids every bound stays. Meant
+// for WithoutColumnStats, which otherwise drops the bounds too; on a full read
+// it only trims the two bound maps.
+func KeepBounds(fieldIDs ...int) ManifestReadOption {
+	return func(o *manifestReadOptions) {
+		o.keepBounds = true
+		if len(fieldIDs) > 0 {
+			o.boundIDs = make(map[int]struct{}, len(fieldIDs))
+			for _, id := range fieldIDs {
+				o.boundIDs[id] = struct{}{}
+			}
+		}
+	}
+}
+
+// droppedFields names the data_file fields the reader schema omits; nil means
+// a full read.
+func (o manifestReadOptions) droppedFields() map[string]bool {
+	if !o.skipColumnStats {
+		return nil
+	}
+	drop := map[string]bool{
+		"column_sizes": true, "value_counts": true, "null_value_counts": true,
+		"nan_value_counts": true, "distinct_counts": true,
+	}
+	if !o.keepBounds {
+		drop["lower_bounds"], drop["upper_bounds"] = true, true
+	}
+
+	return drop
+}
+
+// apply marks a decoded file as projected and trims its bounds to the kept ids.
+func (o manifestReadOptions) apply(df *dataFile) {
+	if o.skipColumnStats {
+		df.statsProjected = true
+	}
+	if o.boundIDs != nil {
+		df.LowerBounds = keepColMapKeys(df.LowerBounds, o.boundIDs)
+		df.UpperBounds = keepColMapKeys(df.UpperBounds, o.boundIDs)
+	}
+}
+
+// keepColMapKeys filters a decoded column map in place to the given keys and
+// clears the dropped tail so its values can be collected.
+func keepColMapKeys[V any](c *[]colMap[int, V], keep map[int]struct{}) *[]colMap[int, V] {
+	if c == nil {
+		return nil
+	}
+	all := *c
+	out := all[:0]
+	for _, kv := range all {
+		if _, ok := keep[kv.Key]; ok {
+			out = append(out, kv)
+		}
+	}
+	clear(all[len(out):])
+	*c = out
+
+	return c
+}
+
+// projectEntrySchema returns the manifest's writer schema with the dropped
+// data_file fields removed: the reader schema avro.Resolve skips them against.
+// Field names, named types and partition fields are untouched.
+func projectEntrySchema(writer *avro.Schema, drop map[string]bool) (*avro.Schema, error) {
+	root := writer.Root()
+	fields := slices.Clone(root.Fields)
+	found := false
+	for i := range fields {
+		if fields[i].Name != "data_file" {
+			continue
+		}
+		df := fields[i].Type
+		kept := make([]avro.SchemaField, 0, len(df.Fields))
+		for _, f := range df.Fields {
+			if !drop[f.Name] {
+				kept = append(kept, f)
+			}
+		}
+		df.Fields = kept
+		fields[i].Type = df
+		found = true
+	}
+	if !found {
+		return nil, errors.New("manifest entry schema has no data_file field")
+	}
+	root.Fields = fields
+
+	return root.Schema()
+}
+
+// ErrProjectedEntry is returned by a ManifestWriter handed an entry that was
+// read with WithoutColumnStats: its statistics are gone, and writing it would
+// silently produce a manifest without them.
+var ErrProjectedEntry = errors.New("manifest entry was read without column statistics and cannot be written")
+
+// ColumnStatsProjected reports whether this file was decoded with
+// WithoutColumnStats: its statistics accessors answer nil (bounds only for the
+// KeepBounds ids) and it must never be written to a manifest.
+func (d *dataFile) ColumnStatsProjected() bool { return d.statsProjected }
+
+// ColumnStatsProjected reports whether df was decoded without its column
+// statistics; false for any DataFile built in memory or read in full.
+func ColumnStatsProjected(df DataFile) bool {
+	p, ok := df.(interface{ ColumnStatsProjected() bool })
+
+	return ok && p.ColumnStatsProjected()
+}
+
+// ManifestEntriesWith streams m's entries like ManifestFile.Entries, decoded
+// under opts: the read-side way to walk a wide table's manifests without their
+// column statistics. With no options it equals m.Entries(fs, discardDeleted).
+func ManifestEntriesWith(fs iceio.IO, m ManifestFile, discardDeleted bool, opts ...ManifestReadOption) iter.Seq2[ManifestEntry, error] {
+	return func(yield func(ManifestEntry, error) bool) {
+		f, err := fs.Open(m.FilePath())
+		if err != nil {
+			yield(nil, err)
+
+			return
+		}
+		aborted := false
+		defer func() {
+			if cerr := f.Close(); cerr != nil && !aborted {
+				yield(nil, cerr)
+			}
+		}()
+
+		for entry, err := range iterManifestWith(m, f, discardDeleted, opts...) {
+			if !yield(entry, err) {
+				aborted = true
+
+				return
+			}
+		}
+	}
+}

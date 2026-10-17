@@ -1764,3 +1764,11 @@ func (c *bloomPredicateCollector) VisitNotStartsWith(_ iceberg.BoundTerm, _ iceb
 func newBloomFilterPredicates(expr iceberg.BooleanExpression) ([]internal.RowGroupBloomPred, error) {
 	return iceberg.VisitExpr(expr, &bloomPredicateCollector{})
 }
+
+// NewManifestEvaluator is the exported form of newManifestEvaluator (bifrost
+// fork): a caller that walks a snapshot's manifests itself can skip the
+// manifests whose partition summaries cannot match partitionFilter, exactly as
+// Scan.PlanFiles does. Manifests without summaries are kept.
+func NewManifestEvaluator(spec iceberg.PartitionSpec, schema *iceberg.Schema, partitionFilter iceberg.BooleanExpression, caseSensitive bool) (func(iceberg.ManifestFile) (bool, error), error) {
+	return newManifestEvaluator(spec, schema, partitionFilter, caseSensitive)
+}
